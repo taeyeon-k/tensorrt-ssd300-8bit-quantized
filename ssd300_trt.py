@@ -121,11 +121,12 @@ class SSD300(torch.nn.Module):
         }
 
         for binding_name in self.trt_engine:
-            shape = self.trt_engine.get_binding_shape(binding_name)
-            dtype = trt.nptype(self.trt_engine.get_binding_dtype(binding_name))
+            shape = self.trt_engine.get_tensor_shape(binding_name)
+            shape = [tensor_nchw.size(0) if dim == -1 else dim for dim in shape]
+            dtype = trt.nptype(self.trt_engine.get_tensor_dtype(binding_name))
             torch_type = np_to_torch_type[dtype]
 
-            if self.trt_engine.binding_is_input(binding_name):
+            if self.trt_engine.get_tensor_mode(binding_name) and (binding_name != "SelectedIndices") and (binding_name != "NumOutputBoxes") and (binding_name != "bboxes") and (binding_name != "probs"):
                 torch_input = vars()[binding_name].to(torch_type)
                 bindings.append(int(torch_input.data_ptr()))
             else:
@@ -133,7 +134,10 @@ class SSD300(torch.nn.Module):
                 trt_outputs.append(torch_output)
                 bindings.append(int(torch_output.data_ptr()))
 
-        self.trt_context.execute_async_v2(bindings=bindings, stream_handle=self.trt_stream.handle)
+        for i in range(self.trt_engine.num_io_tensors):
+            self.trt_context.set_tensor_address(self.trt_engine.get_tensor_name(i), bindings[i])
+
+        self.trt_context.execute_async_v3(stream_handle=self.trt_stream.handle)
         self.trt_stream.synchronize()
 
         return trt_outputs
@@ -155,12 +159,33 @@ class SSD300(torch.nn.Module):
 
         return bboxes, probs, class_indexes, image_indexes
 
+    def trt_postprocess_inms(self, selected_indices, num_output_boxes, bboxes, probs):
+        # selected_indices: [Num_output_boxes, 3] (batchIndex, classIndex, boxIndex)
+        # bboxes: [batch, anchors, classes, 4]
+        # probs: [batch, anchors, classes]
+
+        # Separate batch_index, class_index, box_index in the selected_indices
+        batch_inds, cls_inds, box_inds = selected_indices.unbind(1)
+
+        # Select boxes and scores based on selected_indices
+        selected_boxes = bboxes[batch_inds, box_inds, cls_inds, :]  # shape: [Num_output_boxes, 4]
+        selected_scores = probs[batch_inds, box_inds, cls_inds]     # shape: [Num_output_boxes]
+
+        # Create class_indexes and image_indexes. In here, tensorrt output class started from 0, but coco2017 started from 1 so add 1
+        class_indexes = cls_inds + 1
+        image_indexes = batch_inds
+
+        # prepare returns after NMS
+        flat_locs = selected_boxes  # coordinate of detected boxes
+        flat_probs = selected_scores  # scores of detected boxes
+
+        return flat_locs, flat_probs, class_indexes, image_indexes
 
     def forward_coco(self, tensor_nchw, image_heights, image_widths):
         if self.trt_engine:
-            bboxes, probs, class_indexes, image_indexes = self.trt_postprocess(
-                tensor_nchw.size(0),
-                *self.forward_trt(tensor_nchw, image_heights, image_widths)
+            trt_outputs = self.forward_trt(tensor_nchw, image_heights, image_widths)
+            bboxes, probs, class_indexes, image_indexes = self.trt_postprocess_inms(
+                trt_outputs[0], trt_outputs[1], trt_outputs[2], trt_outputs[3]
             )
         else:
             bboxes, probs = self.forward_pytorch(tensor_nchw, image_heights, image_widths)
@@ -273,7 +298,7 @@ def eval_coco(args):
 
             mapped_labels = class_indexes.to('cpu')
             mapped_labels.apply_(lambda i: inv_map[i])
-            image_ids = img_id[image_indexes]
+            image_ids = img_id[image_indexes.to('cpu')]
 
             batch_results = torch.cat([
                 image_ids.cpu().unsqueeze(-1),
@@ -337,42 +362,6 @@ def build_onnx(args):
     onnx_buf.seek(0)
     onnx_module = shape_inference.infer_shapes(onnx.load(onnx_buf))
 
-    while len(onnx_module.graph.output):
-        onnx_module.graph.output.remove(onnx_module.graph.output[0])
-    onnx_module.graph.output.extend([
-        helper.make_tensor_value_info('num_detections', TensorProto.INT32, [-1]),
-        helper.make_tensor_value_info('nms_bboxes', TensorProto.FLOAT, [-1, -1, -1]),
-        helper.make_tensor_value_info('nms_probs', TensorProto.FLOAT, [-1, -1]),
-        helper.make_tensor_value_info('nms_classes', TensorProto.FLOAT, [-1, -1]),
-    ])
-
-    graph = gs.import_onnx(onnx_module)
-
-    attrs = {
-        'shareLocation': False,
-        'numClasses': 80,
-        'backgroundLabelId': -1,
-        'topK': args.topk,      # per-class, pre NMS
-        'keepTopK': args.topk,  # across-classes, per image
-        'scoreThreshold': args.detection_threshold,
-        'iouThreshold': args.iou_threshold,
-        'isNormalized': False,
-        'clipBoxes': False,
-    }
-
-    ts = graph.tensors()
-
-    nms_layer = graph.layer(
-        op='BatchedNMSDynamic_TRT',
-        attrs=attrs,
-        inputs=[ts['bboxes'], ts['probs']],
-        outputs=[ts['num_detections'], ts['nms_bboxes'], ts['nms_probs'], ts['nms_classes']]
-    )
-
-    graph.cleanup()
-    graph.toposort()
-
-    onnx_module = gs.export_onnx(graph)
     onnx_path = os.path.splitext(args.trt_path)[0] + '.onnx'
     print('saving ONNX model to', onnx_path)
     onnx.save(onnx_module, onnx_path)
@@ -383,15 +372,18 @@ def build_onnx(args):
 def build_trt_engine(onnx_module, args):
     logger = trt.Logger()
 
-    network_flags = 1 << (int)(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
 
     with trt.Builder(logger) as builder, builder.create_network(network_flags) as network, trt.OnnxParser(network, logger) as parser:
-        builder.max_workspace_size = 2 ** 31 # 2 GB
-        builder.max_batch_size = args.batch_dim
-        builder.fp16_mode = args.precision != 'fp32'
-        if args.precision == 'int8':
-            builder.int8_mode = True
-            builder.int8_calibrator = Int8Calibrator(args)
+        config = builder.create_builder_config()
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 ** 31)
+
+        # Precision setting
+        if args.precision == 'fp16':
+            config.set_flag(trt.BuilderFlag.FP16)
+        elif args.precision == 'int8':
+            config.set_flag(trt.BuilderFlag.INT8)
+            config.int8_calibrator = Int8Calibrator(args)
 
         print('parsing ONNX...')
         onnx_buf = io.BytesIO()
@@ -402,31 +394,41 @@ def build_trt_engine(onnx_module, args):
             for i in range(parser.num_errors):
                 print(parser.get_error(i))
 
-        print('inputs:')
-        inputs = {
-            t.name: t.shape
-            for t in [
-                network.get_input(i)
-                for i in range(network.num_inputs)
-            ]
-        }
-        pprint(inputs)
-        print('outputs:')
-        outputs = {
-            t.name: t.shape
-            for t in [
-                network.get_output(i)
-                for i in range(network.num_outputs)
-            ]
-        }
-        pprint(outputs)
+        bboxes = network.get_output(0)  # Bounding boxes
+        scores = network.get_output(1)  # Class confidence scores
+        maxOutput = network.add_constant([], np.int32(args.topk).reshape(-1)).get_output(0)
+        scoreThreshold = network.add_constant([], np.float32(args.detection_threshold).reshape(-1)).get_output(0)
+        iouThreshold = network.add_constant([], np.float32(args.iou_threshold).reshape(-1)).get_output(0)
+
+        network.unmark_output(bboxes)
+        network.unmark_output(scores)
+
+        print('Add INMS layers...')
+        inms_layer = network.add_nms(
+            bboxes,
+            scores,
+            maxOutput
+        )
+        inms_layer.topk_box_limit = args.topk
+
+        inms_layer.set_input(3, iouThreshold)
+        inms_layer.set_input(4, scoreThreshold)
+
+        inms_layer.get_output(0).name = "SelectedIndices"
+        inms_layer.get_output(1).name = "NumOutputBoxes"
+
+        network.mark_output(inms_layer.get_output(0))
+        network.mark_output(inms_layer.get_output(1))
+        
+        network.mark_output(bboxes)
+        network.mark_output(scores)
 
         print('building CUDA engine...')
-        engine = builder.build_cuda_engine(network)
+        engine = builder.build_serialized_network(network, config)
         if engine:
             print('saving CUDA engine to', args.trt_path)
             with open(args.trt_path, 'wb') as mf:
-                mf.write(engine.serialize())
+                mf.write(engine)
 
         return engine
 
@@ -523,11 +525,12 @@ def benchmark(args):
 
                 for stream_id in range(args.num_streams_per_device):
                     for binding_name in model.trt_engine:
-                        shape = model.trt_engine.get_binding_shape(binding_name)
-                        dtype = trt.nptype(model.trt_engine.get_binding_dtype(binding_name))
+                        shape = model.trt_engine.get_tensor_shape(binding_name)
+                        shape = [tensor_nchw.size(0) if dim == -1 else dim for dim in shape]
+                        dtype = trt.nptype(model.trt_engine.get_tensor_dtype(binding_name))
                         torch_type = np_to_torch_type[dtype]
 
-                        if model.trt_engine.binding_is_input(binding_name):
+                        if model.trt_engine.get_tensor_mode(binding_name) and (binding_name != "SelectedIndices") and (binding_name != "NumOutputBoxes") and (binding_name != "bboxes") and (binding_name != "probs"):
                             torch_input = tensors[binding_name].to(torch_type)
                             bindings[stream_id].append(int(torch_input.data_ptr()))
                         else:
@@ -586,10 +589,11 @@ def benchmark(args):
                 detail = context_detail[context_id]
                 stream_id = (bench_iters - context_id) % len(detail['streams'])
                 stream = detail['streams'][stream_id]
-                detail['model'].trt_context.execute_async_v2(
-                    bindings=detail['bindings'][stream_id],
-                    stream_handle=stream.handle
-                )
+                for i in range(detail['model'].trt_engine.num_io_tensors):
+                    detail['model'].trt_context.set_tensor_address(detail['model'].trt_engine.get_tensor_name(i), detail['bindings'][stream_id][i])
+                
+                detail['model'].trt_context.execute_async_v3(
+                    stream_handle=stream.handle)
                 event = cuda.Event(cuda.event_flags.DISABLE_TIMING)
                 event_queue.put((context, event.record(stream)))
             finally:
